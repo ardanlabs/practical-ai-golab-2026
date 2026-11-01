@@ -296,41 +296,20 @@ example15-step6:
 example15-step7:
 	go run ./cmd/examples/example15/step7
 
-ws-ragpipeline-step1:
-	go run ./cmd/examples/example16/step1
+example16-ingest:
+	go run ./cmd/examples/example16 ingest
 
-ws-ragpipeline-step2:
-	go run ./cmd/examples/example16/step2
+example16:
+	go run ./cmd/examples/example16 ask
 
-ws-ragpipeline-step3:
-	go run ./cmd/examples/example16/step3
-
-ws-ragpipeline-step4:
-	go run ./cmd/examples/example16/step4
-
-ws-ragpipeline-step4-stats:
-	go run ./cmd/examples/example16/step4 -stats
-
-ws-ragpipeline-step5:
-	go run ./cmd/examples/example16/step5
-
-ws-ragpipeline-step5-stats:
-	go run ./cmd/examples/example16/step5 -stats
-
-# Aliases using the exampleNN naming convention.
-example16-step1: ws-ragpipeline-step1
-example16-step2: ws-ragpipeline-step2
-example16-step3: ws-ragpipeline-step3
-example16-step4: ws-ragpipeline-step4
-example16-step4-stats: ws-ragpipeline-step4-stats
-example16-step5: ws-ragpipeline-step5
-example16-step5-stats: ws-ragpipeline-step5-stats
+example16-baseline:
+	go run ./cmd/examples/example16 baseline
 
 # Render what one step adds to the step before it. BASE defaults to STEP-1, so
 # a different base has to be asked for:
 #
-#	make stepdiff EX=16 STEP=4
-#	make stepdiff EX=16 STEP=4 BASE=2
+#	make stepdiff EX=15 STEP=4
+#	make stepdiff EX=15 STEP=4 BASE=2
 stepdiff: BASE ?= $(shell expr $(STEP) - 1)
 stepdiff:
 	@git --no-pager diff --no-index -- \

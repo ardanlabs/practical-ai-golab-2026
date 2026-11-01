@@ -235,7 +235,7 @@ models:
     physical-batch-size: 512
     nseq-max: 4
 
-  # Reranking. example16/step5. A cross-encoder: question plus chunk in, one
+  # Reranking. example16. A cross-encoder: question plus chunk in, one
   # score out, so nseq-max here is query-document pairs per batch.
   gpustack/bge-reranker-v2-m3-Q8_0:
     context-window: 8192
