@@ -19,3 +19,4 @@
 Always apply these skills when doing feature work; do not rely on memory:
 
 - `layered-architecture-types` - before writing, editing, or auditing any `app/*`, `business/domain/*bus`, or `business/domain/*/stores/*db` Go file. Holds the App ↔ Business ↔ Storage type-boundary rules below.
+- `use-modern-go` - before writing, editing, or auditing any Go files, load this skill and make sure you are using the latest Go features. The project uses Go 1.27.
