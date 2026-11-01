@@ -47,7 +47,7 @@ const (
 // Every one is overridable so a room with a different endpoint is not stuck.
 var (
 	llmURL     = "http://localhost:11435/v1/chat/completions"
-	llmModel   = "unsloth/Qwen3-8B-Q8_0"
+	llmModel   = "unsloth/LFM2-700M-Q8_0"
 	embedURL   = "http://localhost:11435/v1/embeddings"
 	embedModel = "ggml-org/embeddinggemma-300m-qat-Q8_0"
 
