@@ -1,7 +1,11 @@
 // This example shows you how to use MongoDB and Kronk to perform a vector
-// search for a user question. The search will return the top 2 chunks from
-// the database. Then these chunks are sent to the Qwen model to create a
-// coherent response. You must run example05 first.
+// search for a user question. Before searching, the Qwen model extracts the Go
+// features and concepts the user is asking about, and only those are embedded.
+// A raw question carries filler ("can you tell me how...") that pulls its
+// vector away from the book chunks, so embedding the distilled features gives
+// a closer match. The search will return the top 2 chunks from the database.
+// Then these chunks are sent to the Qwen model, along with the original
+// question, to create a coherent response. You must run example05 first.
 //
 // # Running the example:
 //
@@ -21,6 +25,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -81,7 +86,14 @@ func run() error {
 
 	fmt.Print("\n")
 
-	results, err := vectorSearch(ctx, question)
+	features, err := extractFeatures(ctx, question)
+	if err != nil {
+		return fmt.Errorf("extractFeatures: %w", err)
+	}
+
+	fmt.Printf("Searching for: %s\n\n", features)
+
+	results, err := vectorSearch(ctx, features)
 	if err != nil {
 		return fmt.Errorf("vectorSearch: %w", err)
 	}
@@ -93,10 +105,78 @@ func run() error {
 	return nil
 }
 
-func vectorSearch(ctx context.Context, question string) ([]searchResult, error) {
+// extractFeatures asks the chat model to reduce the user's question to the Go
+// features and concepts it is about. That text, not the raw question, is what
+// gets embedded for the vector search.
+func extractFeatures(ctx context.Context, question string) (string, error) {
+	const prompt = `Extract the Go programming language features and concepts that the
+	QUESTION is asking about.
+
+	Rules:
+	- Respond with at most %d comma-separated terms on a single line and nothing else.
+	- Use the terminology a Go book would use (for example "goroutines",
+	  "channels", "interfaces", "method sets", "escape analysis").
+	- Do not answer the question and do not explain your choices.
+
+	QUESTION:
+	%s
+	/no_think`
+
+	// A short list keeps the embedding focused. An open-ended list lets the
+	// model drift into loosely related terms, and eventually into a loop.
+	const maxFeatures = 8
+
+	// This should take well under a second. Give it its own deadline so a
+	// runaway generation fails fast instead of eating the whole run's budget.
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	llm := client.NewLLM(urlChat, modelChat)
+
+	// Qwen3's recommended non-thinking sampling plus a repeat penalty. Greedy
+	// decoding (temperature 0) makes Qwen3 repeat itself until it times out.
+	answer, err := llm.ChatCompletions(ctx, fmt.Sprintf(prompt, maxFeatures, question),
+		client.WithParams(0.7, 0.8, 20),
+		client.WithRepeatPenalty(1.1, 64),
+	)
+	if err != nil {
+		return "", fmt.Errorf("chat completions: %w", err)
+	}
+
+	// Qwen3 may emit a <think>...</think> block before its answer even when
+	// asked not to. Only the text after it is the list of features.
+	if _, after, found := strings.Cut(answer, "</think>"); found {
+		answer = after
+	}
+
+	// Don't trust the model to respect the limit: normalize, drop empty and
+	// duplicate terms, and cap the list ourselves.
+	var features []string
+	for term := range strings.SplitSeq(answer, ",") {
+		term = strings.Join(strings.Fields(term), " ")
+		if term == "" || slices.Contains(features, term) {
+			continue
+		}
+
+		features = append(features, term)
+		if len(features) == maxFeatures {
+			break
+		}
+	}
+
+	// If the model came back with nothing usable, searching with the original
+	// question is still better than searching with an empty string.
+	if len(features) == 0 {
+		return question, nil
+	}
+
+	return strings.Join(features, ", "), nil
+}
+
+func vectorSearch(ctx context.Context, features string) ([]searchResult, error) {
 	llm := client.NewLLM(urlEmbed, modelEmbed)
 
-	vector, err := llm.EmbedText(ctx, question)
+	vector, err := llm.EmbedText(ctx, features)
 	if err != nil {
 		return nil, fmt.Errorf("do: %w", err)
 	}
