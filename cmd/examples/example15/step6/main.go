@@ -134,7 +134,7 @@ func run() error {
 		"Same document as 6b with \"tool_browse\" dotted. The regex blocklist finds",
 		"no literal trigger phrase and passes the document. The hardened prompt",
 		"cannot stop an instruction that arrives inside a retrieved document, and",
-		"The LFM2-700M classifier is under-powered and passes it too, as it does",
+		"the LFM2-700M classifier is under-powered and passes it too, as it does",
 		"the plain form. The model reads the dotted form.",
 		"Defenses: "+content.String(),
 	)

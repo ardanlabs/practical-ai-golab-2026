@@ -45,9 +45,15 @@ const (
 
 // Defaults match the Kronk server the workshop brings up with `make kronk-up`.
 // Every one is overridable so a room with a different endpoint is not stuck.
+//
+// The answering model has to be capable enough to make real tool calls. A
+// small model here (LFM2-700M was tried) never calls a tool at all: every
+// attack comes back ANSWERED, no defense is ever exercised, and recon "leaks"
+// hallucinated library names. Steps that want a weak classifier swap only the
+// classifier with WithClassifierModel and leave this alone.
 var (
 	llmURL     = "http://localhost:11435/v1/chat/completions"
-	llmModel   = "unsloth/LFM2-700M-Q8_0"
+	llmModel   = "unsloth/Qwen3-8B-Q8_0"
 	embedURL   = "http://localhost:11435/v1/embeddings"
 	embedModel = "ggml-org/embeddinggemma-300m-qat-Q8_0"
 
