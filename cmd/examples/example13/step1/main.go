@@ -1,0 +1,354 @@
+// This example shows you how to create a simple chat application against an
+// inference model using the kronk SDK. Thanks to Kronk and yzma, reasoning and
+// tool calling is enabled.
+//
+// The first time you run this program the system will download and install
+// the model and libraries.
+//
+// Run the example like this from the root of the project:
+//	$ make example13-step1
+
+package main
+
+import (
+	"bufio"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"strings"
+	"time"
+
+	"github.com/ardanlabs/kronk/sdk/kronk"
+	"github.com/ardanlabs/kronk/sdk/kronk/model"
+	"github.com/ardanlabs/kronk/sdk/tools/defaults"
+	"github.com/ardanlabs/kronk/sdk/tools/libs"
+	"github.com/ardanlabs/kronk/sdk/tools/models"
+)
+
+const modelSource = "unsloth/Qwen3.6-35B-A3B-UD-Q4_K_XL"
+
+func main() {
+	if err := run(); err != nil {
+		fmt.Printf("\nERROR: %s\n", err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
+	mp, err := installSystem()
+	if err != nil {
+		return fmt.Errorf("run: unable to installation system: %w", err)
+	}
+
+	krn, err := newKronk(mp)
+	if err != nil {
+		return fmt.Errorf("unable to init kronk: %w", err)
+	}
+
+	defer func() {
+		fmt.Println("\nUnloading Kronk")
+		if err := krn.Unload(context.Background()); err != nil {
+			fmt.Printf("run: failed to unload model: %v", err)
+		}
+	}()
+
+	if err := chat(krn); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func installSystem() (models.Path, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Minute)
+	defer cancel()
+
+	libs, err := libs.New(
+		libs.WithVersion(defaults.LibVersion("")),
+	)
+	if err != nil {
+		return models.Path{}, err
+	}
+
+	if _, err := libs.Download(ctx, kronk.FmtLogger); err != nil {
+		return models.Path{}, fmt.Errorf("unable to install llama.cpp: %w", err)
+	}
+
+	// -------------------------------------------------------------------------
+
+	mdls, err := models.New()
+	if err != nil {
+		return models.Path{}, fmt.Errorf("unable to install llama.cpp: %w", err)
+	}
+
+	mp, err := mdls.Download(ctx, kronk.FmtLogger, modelSource)
+	if err != nil {
+		return models.Path{}, fmt.Errorf("unable to install model: %w", err)
+	}
+
+	// -------------------------------------------------------------------------
+
+	// You could also download this model by naming the HuggingFace repo and
+	// the quantization you want, or by passing the full HuggingFace URL.
+	// mp, err := mdls.Download(ctx, kronk.FmtLogger, "unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_XL")
+	// if err != nil {
+	// 	return models.Path{}, fmt.Errorf("unable to download model: %w", err)
+	// }
+
+	return mp, nil
+}
+
+func newKronk(mp models.Path) (*kronk.Kronk, error) {
+	fmt.Println("loading model...")
+
+	if err := kronk.Init(); err != nil {
+		return nil, fmt.Errorf("unable to init kronk: %w", err)
+	}
+
+	krn, err := kronk.New(
+		model.WithModelFiles(mp.ModelFiles),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("unable to create inference model: %w", err)
+	}
+
+	fmt.Print("- system info:\n\t")
+	for k, v := range krn.SystemInfo() {
+		fmt.Printf("%s:%v, ", k, v)
+	}
+	fmt.Println()
+
+	fmt.Println("- contextWindow:", krn.ModelConfig().ContextWindow())
+	fmt.Printf("- k/v          : %s/%s\n", krn.ModelConfig().CacheTypeK, krn.ModelConfig().CacheTypeV)
+	fmt.Println("- nBatch       :", krn.ModelConfig().EffectiveNBatch())
+	fmt.Println("- nuBatch      :", krn.ModelConfig().EffectiveNUBatch())
+	fmt.Println("- embeddings   :", krn.ModelInfo().IsEmbedModel)
+	fmt.Println("- template     :", krn.ModelInfo().Template.FileName)
+	fmt.Println("- grammar      :", krn.ModelConfig().DefaultParams.Grammar != "")
+
+	return krn, nil
+}
+
+func chat(krn *kronk.Kronk) error {
+	messages := model.DocumentArray()
+
+	var systemPrompt = `
+		You are a helpful AI assistant. You are designed to help users answer
+		questions, create content, and provide information in a helpful and
+		accurate manner. Always follow the user's instructions carefully and
+		respond with clear, concise, and well-structured answers. You are a
+		helpful AI assistant. You are designed to help users answer questions,
+		create content, and provide information in a helpful and accurate manner.
+		Always follow the user's instructions carefully and respond with clear,
+		concise, and well-structured answers. You are a helpful AI assistant.
+		You are designed to help users answer questions, create content, and
+		provide information in a helpful and accurate manner. Always follow the
+		user's instructions carefully and respond with clear, concise, and
+		well-structured answers.`
+
+	messages = append(messages,
+		model.TextMessage(model.RoleSystem, systemPrompt),
+	)
+
+	reader := bufio.NewReader(os.Stdin)
+
+	for {
+		var err error
+		messages, err = userInput(reader, messages)
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			return fmt.Errorf("run:user input: %w", err)
+		}
+
+		messages, err = func() ([]model.D, error) {
+			ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+			defer cancel()
+
+			d := model.D{
+				"messages":   messages,
+				"tools":      toolDocuments(),
+				"max_tokens": 2048,
+
+				// Without this, a streaming call reports no usage at all and
+				// the token accounting below never runs.
+				"stream_options": model.D{
+					"include_usage": true,
+				},
+			}
+
+			ch, err := performChat(ctx, krn, d)
+			if err != nil {
+				return nil, fmt.Errorf("run: unable to perform chat: %w", err)
+			}
+
+			messages, err = modelResponse(krn, messages, ch)
+			if err != nil {
+				return nil, fmt.Errorf("run: model response: %w", err)
+			}
+
+			return messages, nil
+		}()
+
+		if err != nil {
+			return fmt.Errorf("run: unable to perform chat: %w", err)
+		}
+	}
+}
+
+func userInput(reader *bufio.Reader, messages []model.D) ([]model.D, error) {
+	for {
+		fmt.Print("\nUSER> ")
+
+		userInput, err := reader.ReadString('\n')
+		if err != nil {
+			return messages, fmt.Errorf("unable to read user input: %w", err)
+		}
+
+		userInput = strings.TrimSpace(userInput)
+
+		switch userInput {
+		case "":
+			continue
+
+		case "quit":
+			return nil, io.EOF
+		}
+
+		messages = append(messages,
+			model.TextMessage(model.RoleUser, userInput),
+		)
+
+		return messages, nil
+	}
+}
+
+func toolDocuments() []model.D {
+	return model.DocumentArray(
+		model.D{
+			"type": "function",
+			"function": model.D{
+				"name":        "get_weather",
+				"description": "Get the current weather for a location",
+				"parameters": model.D{
+					"type": "object",
+					"properties": model.D{
+						"location": model.D{
+							"type":        "string",
+							"description": "The location to get the weather for, e.g. San Francisco, CA",
+						},
+					},
+					"required": []any{"location"},
+				},
+			},
+		},
+	)
+}
+
+func performChat(ctx context.Context, krn *kronk.Kronk, d model.D) (<-chan model.ChatResponse, error) {
+	ch, err := krn.ChatStreaming(ctx, d)
+	if err != nil {
+		return nil, fmt.Errorf("chat streaming: %w", err)
+	}
+
+	return ch, nil
+}
+
+func modelResponse(krn *kronk.Kronk, messages []model.D, ch <-chan model.ChatResponse) ([]model.D, error) {
+	fmt.Print("\nMODEL> ")
+
+	var reasoning bool
+	var lr model.ChatResponse
+
+	for resp := range ch {
+		if resp.Usage != nil {
+			lr = resp
+		}
+
+		if len(resp.Choices) == 0 {
+			continue
+		}
+
+		switch resp.Choices[0].FinishReason() {
+		case model.FinishReasonError:
+			return messages, fmt.Errorf("error from model: %s", resp.Choices[0].Delta.Content)
+
+		case model.FinishReasonStop, model.FinishReasonLength:
+
+			// The final response carries the complete answer on the message.
+			// Keep it in the history so the model can see its own replies on
+			// the next turn.
+			if msg := resp.Choices[0].Message; msg != nil && msg.Content != "" {
+				messages = append(messages,
+					model.TextMessage(model.RoleAssistant, msg.Content),
+				)
+			}
+
+			continue
+
+		case model.FinishReasonTool:
+			fmt.Println()
+			fmt.Printf("\u001b[92mModel Asking For Tool Calls:\n\u001b[0m")
+
+			// The response carrying the tool finish reason has an empty delta.
+			// The completed calls live on the message instead, so reading them
+			// off the delta finds nothing every time.
+			if resp.Choices[0].Message == nil {
+				continue
+			}
+
+			for _, tool := range resp.Choices[0].Message.ToolCalls {
+				fmt.Printf("\u001b[92mToolID[%s]: %s(%v)\n\u001b[0m",
+					tool.ID,
+					tool.Function.Name,
+					tool.Function.Arguments,
+				)
+
+				messages = append(messages,
+					model.TextMessage("tool", fmt.Sprintf("Tool call %s: %s(%v)\n",
+						tool.ID,
+						tool.Function.Name,
+						tool.Function.Arguments),
+					),
+				)
+			}
+
+			continue
+
+		default:
+			if resp.Choices[0].Delta.Reasoning != "" {
+				fmt.Printf("\u001b[91m%s\u001b[0m", resp.Choices[0].Delta.Reasoning)
+				reasoning = true
+				continue
+			}
+
+			if reasoning {
+				reasoning = false
+
+				fmt.Println()
+			}
+
+			fmt.Printf("%s", resp.Choices[0].Delta.Content)
+		}
+	}
+
+	// -------------------------------------------------------------------------
+
+	if lr.Usage == nil {
+		fmt.Println()
+		return messages, nil
+	}
+
+	contextTokens := lr.Usage.PromptTokens + lr.Usage.CompletionTokens
+	contextWindow := krn.ModelConfig().ContextWindow()
+	percentage := (float64(contextTokens) / float64(contextWindow)) * 100
+	of := float32(contextWindow) / float32(1024)
+
+	fmt.Printf("\n\n\u001b[90mInput: %d  Reasoning: %d  Completion: %d  Window: %d (%.0f%% of %.0fK) TPS: %.2f\u001b[0m\n",
+		lr.Usage.PromptTokens, lr.Usage.CompletionTokensDetails.ReasoningTokens, lr.Usage.CompletionTokens, contextTokens, percentage, of, lr.Usage.TokensPerSecond)
+
+	return messages, nil
+}

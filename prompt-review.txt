@@ -1,8 +1,0 @@
-Dave, load your skills per @AGENTS.md, your pr review skill to skeptically, critically, and
-adversarially review this PR. Be terse but thorough.
-Do a pass against the ticket/acceptance criteria defined in this JIRA ticket: https://jira.atlassian.net/browse/ABC-1234
-When you are done, write the findings under plans/findings/ABC-1234/01/finding.md.
-Then, critically and skeptically review those files too and update the file in place.
-Make it read standalone, ignoring the several passes against the review file.
-Write a plans/findings/ABC-1234/01/diagrams.md file with Mermaid diagrams for how the feature in this PR should work.
-Break it down into several diagrams, including for data types, and how the client is supposed to interact with the feature, not just the inner workings.

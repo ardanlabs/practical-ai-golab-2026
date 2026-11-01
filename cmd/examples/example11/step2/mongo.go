@@ -1,0 +1,113 @@
+package main
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/ardanlabs/practical-ai-golab2026/foundation/client"
+	"github.com/ardanlabs/practical-ai-golab2026/foundation/mongodb"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
+)
+
+const (
+	dbName     = "example11"
+	colName    = "trainingvideo"
+	dimensions = 768
+)
+
+// searchResult matches the fields of the document step1 stores.
+type searchResult struct {
+	Video     string    `bson:"video" json:"video"`
+	Chunk     string    `bson:"chunk" json:"chunk"`
+	StartTime float64   `bson:"start_time" json:"start_time"`
+	Duration  float64   `bson:"duration" json:"duration"`
+	Text      string    `bson:"text" json:"text"`
+	Embedding []float64 `bson:"embedding" json:"-"`
+	Score     float64   `bson:"score" json:"-"`
+}
+
+// =============================================================================
+
+func initDB(ctx context.Context, client *mongo.Client) (*mongo.Collection, error) {
+	db := client.Database(dbName)
+
+	col, err := mongodb.CreateCollection(ctx, db, colName)
+	if err != nil {
+		return nil, fmt.Errorf("createCollection: %w", err)
+	}
+
+	const textIndexName = "vector_embedding_index"
+
+	settings := mongodb.VectorIndexSettings{
+		NumDimensions: dimensions,
+		Path:          "embedding",
+		Similarity:    "cosine",
+	}
+
+	if err := mongodb.CreateVectorIndex(ctx, col, textIndexName, settings); err != nil {
+		return nil, fmt.Errorf("createVectorIndex (text): %w", err)
+	}
+
+	indexModel := mongo.IndexModel{
+		Keys:    bson.D{{Key: "video", Value: 1}, {Key: "chunk", Value: 1}},
+		Options: options.Index().SetUnique(true),
+	}
+	if _, err := col.Indexes().CreateOne(ctx, indexModel); err != nil {
+		return nil, fmt.Errorf("createIndex (video, chunk): %w", err)
+	}
+
+	return col, nil
+}
+
+func textVectorSearch(ctx context.Context, llm *client.LLM, col *mongo.Collection, question string) ([]searchResult, error) {
+	vector, err := llm.EmbedText(ctx, question)
+	if err != nil {
+		return nil, fmt.Errorf("embedText: %w", err)
+	}
+
+	return vectorSearch(ctx, col, vector)
+}
+
+func vectorSearch(ctx context.Context, col *mongo.Collection, vector []float64) ([]searchResult, error) {
+	pipeline := mongo.Pipeline{
+		{{
+			Key: "$vectorSearch",
+			Value: bson.M{
+				"index":       "vector_embedding_index",
+				"exact":       true,
+				"path":        "embedding",
+				"queryVector": vector,
+				"limit":       2,
+			}},
+		},
+		{{
+			Key: "$project",
+			Value: bson.M{
+				"video":      1,
+				"chunk":      1,
+				"start_time": 1,
+				"duration":   1,
+				"text":       1,
+				"embedding":  1,
+				"score": bson.M{
+					"$meta": "vectorSearchScore",
+				},
+			}},
+		},
+	}
+
+	cur, err := col.Aggregate(ctx, pipeline)
+	if err != nil {
+		return nil, fmt.Errorf("aggregate: %w", err)
+	}
+	defer cur.Close(ctx)
+
+	var results []searchResult
+	if err := cur.All(ctx, &results); err != nil {
+		return nil, fmt.Errorf("all: %w", err)
+	}
+
+	return results, nil
+}

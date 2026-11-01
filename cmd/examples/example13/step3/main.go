@@ -1,0 +1,403 @@
+// This example shows you a complete RAG application using DuckDB as an embedding
+// DB and an embedding model to generate embeddings, and a chat model for
+// answering a question using the Kronk SDK.
+//
+// # Running the example:
+//
+//	$ make example13-step3
+
+package main
+
+import (
+	"bufio"
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"strings"
+	"time"
+
+	"github.com/ardanlabs/kronk/sdk/kronk"
+	"github.com/ardanlabs/kronk/sdk/kronk/model"
+	"github.com/ardanlabs/kronk/sdk/tools/defaults"
+	"github.com/ardanlabs/kronk/sdk/tools/libs"
+	"github.com/ardanlabs/kronk/sdk/tools/models"
+	"github.com/ardanlabs/practical-ai-golab2026/cmd/examples/example13/duck"
+)
+
+const (
+	modelChatSource  = "unsloth/Qwen3.6-35B-A3B-UD-Q4_K_XL"
+	modelEmbedSource = "ggml-org/embeddinggemma-300m-qat-Q8_0"
+	dbPath           = "zarf/data/duck-ex13-step3.db" // ":memory:"
+	chunksFile       = "zarf/data/book.chunks"
+	dimensions       = 768
+)
+
+func main() {
+	if err := run(); err != nil {
+		fmt.Printf("\nERROR: %s\n", err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
+	infoEmbed, infoChat, err := installSystem()
+	if err != nil {
+		return fmt.Errorf("unable to install system: %w", err)
+	}
+
+	krnEmbed, err := newKronk(infoEmbed)
+	if err != nil {
+		return fmt.Errorf("unable to create embedding model: %w", err)
+	}
+	defer func() {
+		fmt.Println("\nUnloading embedding model")
+		if err := krnEmbed.Unload(context.Background()); err != nil {
+			fmt.Printf("failed to unload embedding model: %v", err)
+		}
+	}()
+
+	krnChat, err := newKronk(infoChat)
+	if err != nil {
+		return fmt.Errorf("unable to create chat model: %w", err)
+	}
+	defer func() {
+		fmt.Println("\nUnloading chat model")
+		if err := krnChat.Unload(context.Background()); err != nil {
+			fmt.Printf("failed to unload chat model: %v", err)
+		}
+	}()
+
+	// -------------------------------------------------------------------------
+
+	db, err := duck.LoadData(dbPath, krnEmbed, dimensions, chunksFile)
+	if err != nil {
+		return fmt.Errorf("error connecting to database: %w", err)
+	}
+	defer db.Close()
+
+	// -------------------------------------------------------------------------
+
+	var messages []model.D
+
+	reader := bufio.NewReader(os.Stdin)
+
+	for {
+		messages, err = userInput(reader, messages)
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			return fmt.Errorf("unable to get user input: %w", err)
+		}
+
+		// ---------------------------------------------------------------------
+
+		docs, err := func() ([]duck.Document, error) {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+
+			docs, err := vectorSearch(ctx, krnEmbed, db, messages)
+			if err != nil {
+				return nil, fmt.Errorf("unable to get vector search results: %w", err)
+			}
+
+			return docs, nil
+		}()
+
+		if err != nil {
+			return fmt.Errorf("unable to get vector search results: %w", err)
+		}
+
+		// ---------------------------------------------------------------------
+
+		messages, err = func() ([]model.D, error) {
+			ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+			defer cancel()
+
+			d := model.D{
+				"messages":    addContextPrompt(docs, messages),
+				"max_tokens":  2048,
+				"temperature": 0.7,
+				"top_p":       0.9,
+				"top_k":       40,
+
+				// Without this, a streaming call reports no usage at all and
+				// the token accounting below never runs.
+				"stream_options": model.D{
+					"include_usage": true,
+				},
+			}
+
+			ch, err := performChat(ctx, krnChat, d)
+			if err != nil {
+				return nil, fmt.Errorf("unable to perform chat: %w", err)
+			}
+
+			messages, err = modelResponse(krnChat, messages, ch)
+			if err != nil {
+				return nil, fmt.Errorf("unable to get model response: %w", err)
+			}
+
+			return messages, nil
+		}()
+
+		if err != nil {
+			return fmt.Errorf("unable to perform chat: %w", err)
+		}
+	}
+}
+
+func installSystem() (models.Path, models.Path, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Minute)
+	defer cancel()
+
+	libs, err := libs.New(
+		libs.WithVersion(defaults.LibVersion("")),
+	)
+	if err != nil {
+		return models.Path{}, models.Path{}, err
+	}
+
+	if _, err := libs.Download(ctx, kronk.FmtLogger); err != nil {
+		return models.Path{}, models.Path{}, fmt.Errorf("unable to install llama.cpp: %w", err)
+	}
+
+	// -------------------------------------------------------------------------
+
+	mdls, err := models.New()
+	if err != nil {
+		return models.Path{}, models.Path{}, fmt.Errorf("unable to create models api: %w", err)
+	}
+
+	infoEmbed, err := mdls.Download(ctx, kronk.FmtLogger, modelEmbedSource)
+	if err != nil {
+		return models.Path{}, models.Path{}, fmt.Errorf("unable to install model: %w", err)
+	}
+
+	infoChat, err := mdls.Download(ctx, kronk.FmtLogger, modelChatSource)
+	if err != nil {
+		return models.Path{}, models.Path{}, fmt.Errorf("unable to install model: %w", err)
+	}
+
+	return infoEmbed, infoChat, nil
+}
+
+func newKronk(mp models.Path) (*kronk.Kronk, error) {
+	if err := kronk.Init(); err != nil {
+		return nil, fmt.Errorf("unable to init kronk: %w", err)
+	}
+
+	krn, err := kronk.New(
+		model.WithModelFiles(mp.ModelFiles),
+	)
+
+	if err != nil {
+		return nil, fmt.Errorf("unable to create inference model: %w", err)
+	}
+
+	fmt.Print("- system info:\n\t")
+	for k, v := range krn.SystemInfo() {
+		fmt.Printf("%s:%v, ", k, v)
+	}
+	fmt.Println()
+
+	fmt.Println("- contextWindow:", krn.ModelConfig().ContextWindow())
+	fmt.Println("- embeddings   :", krn.ModelInfo().IsEmbedModel)
+	fmt.Println("- template     :", krn.ModelInfo().Template.FileName)
+
+	return krn, nil
+}
+
+func userInput(reader *bufio.Reader, messages []model.D) ([]model.D, error) {
+	for {
+		fmt.Print("\nUSER> ")
+
+		userInput, err := reader.ReadString('\n')
+		if err != nil {
+			return messages, fmt.Errorf("unable to read user input: %w", err)
+		}
+
+		userInput = strings.TrimSpace(userInput)
+
+		switch userInput {
+		case "":
+			continue
+
+		case "quit":
+			return nil, io.EOF
+		}
+
+		messages = append(messages, model.TextMessage("user", userInput))
+
+		return messages, nil
+	}
+}
+
+func vectorSearch(ctx context.Context, krnEmbed *kronk.Kronk, db *sql.DB, messages []model.D) ([]duck.Document, error) {
+	fmt.Print("\n--- Vector Search ---\n\n")
+
+	d := model.D{
+		"input": messages[len(messages)-1]["content"].(string),
+	}
+
+	resp, err := krnEmbed.Embeddings(ctx, d)
+	if err != nil {
+		return nil, fmt.Errorf("embed: %w", err)
+	}
+
+	if len(resp.Data) == 0 || len(resp.Data[0].Embedding) == 0 {
+		return nil, fmt.Errorf("empty query vector")
+	}
+
+	docs, err := duck.Search(db, resp.Data[0].Embedding, 5)
+	if err != nil {
+		return nil, fmt.Errorf("error searching database: %w", err)
+	}
+
+	for _, doc := range docs {
+		text := strings.ReplaceAll(doc.Text, "\n", " ")
+		fmt.Printf("Doc: %f: %s\n", doc.Similarity, text[:min(len(text), 100)])
+	}
+
+	return docs, nil
+}
+
+func addContextPrompt(documents []duck.Document, messages []model.D) []model.D {
+	const prompt = `
+		- Use the following Context to answer the user's question.
+		- If you don't know the answer, say that you don't know.
+		- Responses should be properly formatted to be easily read.
+		- Share code if code is presented in the context.
+		- Do not include any additional information not present in the context.
+
+		Context:
+		
+		%s
+
+		Question: %s
+		`
+
+	var count int
+	var content strings.Builder
+	for _, doc := range documents {
+		content.WriteString(fmt.Sprintf("%s\n", doc.Text))
+		count++
+		if count == 2 {
+			break
+		}
+	}
+
+	lastUserInput := messages[len(messages)-1]["content"].(string)
+	finalPrompt := fmt.Sprintf(prompt, content.String(), lastUserInput)
+
+	messages = append(messages, model.TextMessage("user", finalPrompt))
+
+	return messages
+}
+
+func performChat(ctx context.Context, krn *kronk.Kronk, d model.D) (<-chan model.ChatResponse, error) {
+	ch, err := krn.ChatStreaming(ctx, d)
+	if err != nil {
+		return nil, fmt.Errorf("chat streaming: %w", err)
+	}
+
+	return ch, nil
+}
+
+func modelResponse(krn *kronk.Kronk, messages []model.D, ch <-chan model.ChatResponse) ([]model.D, error) {
+	fmt.Print("\nMODEL> ")
+
+	var reasoning bool
+	var lr model.ChatResponse
+
+	for resp := range ch {
+		if resp.Usage != nil {
+			lr = resp
+		}
+
+		// The usage report arrives as its own response carrying no choices, so
+		// it has to be picked up before anything indexes into them.
+		if len(resp.Choices) == 0 {
+			continue
+		}
+
+		switch resp.Choices[0].FinishReason() {
+		case model.FinishReasonError:
+			return messages, fmt.Errorf("error from model: %s", resp.Choices[0].Delta.Content)
+
+		case model.FinishReasonStop, model.FinishReasonLength:
+
+			// The final response carries the complete answer on the message.
+			// Keep it in the history so the model can see its own replies on
+			// the next turn.
+			if msg := resp.Choices[0].Message; msg != nil && msg.Content != "" {
+				messages = append(messages, model.TextMessage("assistant", msg.Content))
+			}
+
+			continue
+
+		case model.FinishReasonTool:
+			fmt.Println()
+
+			// The response carrying the tool finish reason has an empty delta.
+			// The completed calls live on the message instead, so reading them
+			// off the delta finds nothing every time.
+			if resp.Choices[0].Message == nil {
+				continue
+			}
+
+			for _, tool := range resp.Choices[0].Message.ToolCalls {
+				fmt.Printf("\u001b[92mModel Asking For Tool Call:\nToolID[%s]: %s(%v)\u001b[0m\n",
+					tool.ID,
+					tool.Function.Name,
+					tool.Function.Arguments,
+				)
+
+				messages = append(messages,
+					model.TextMessage("tool", fmt.Sprintf("Tool call %s: %s(%v)",
+						tool.ID,
+						tool.Function.Name,
+						tool.Function.Arguments),
+					),
+				)
+			}
+
+			continue
+
+		default:
+			if resp.Choices[0].Delta.Reasoning != "" {
+				fmt.Printf("\u001b[91m%s\u001b[0m", resp.Choices[0].Delta.Reasoning)
+				reasoning = true
+				continue
+			}
+
+			if reasoning {
+				reasoning = false
+
+				fmt.Println()
+			}
+
+			fmt.Printf("%s", resp.Choices[0].Delta.Content)
+		}
+	}
+
+	// -------------------------------------------------------------------------
+
+	if lr.Usage == nil {
+		fmt.Println()
+		return messages, nil
+	}
+
+	contextTokens := lr.Usage.PromptTokens + lr.Usage.CompletionTokens
+	contextWindow := krn.ModelConfig().ContextWindow()
+	percentage := (float64(contextTokens) / float64(contextWindow)) * 100
+	of := float32(contextWindow) / float32(1024)
+
+	fmt.Printf("\n\n\u001b[90mPrompt: %d  Reasoning: %d  Completion: %d  Window: %d (%.0f%% of %.0fK) TPS: %.2f\u001b[0m\n",
+		lr.Usage.PromptTokens, lr.Usage.CompletionTokensDetails.ReasoningTokens, lr.Usage.CompletionTokens, contextTokens, percentage, of, lr.Usage.TokensPerSecond)
+
+	return messages, nil
+}
