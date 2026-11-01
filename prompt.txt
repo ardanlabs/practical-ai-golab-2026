@@ -1,3 +1,7 @@
+@AGENTS.md let's implement @prompt.txt.
+  When you have to make a decision, or a judgment calls, first ask me, using the native UI, list the pros and cons, and tell me a brief description of the
+  problem. Be concise.
+
 Let's create an application that has three routes, a healthcheck one, a Hello one, and a List Users one.
 The healthcheck should just reply a 200 to any GET request.
 The Hello one should be a GET route that replies back to the user with the message "Hello, {USER}". The user parameter should come from the route.
